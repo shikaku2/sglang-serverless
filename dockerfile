@@ -37,6 +37,7 @@ RUN pip3 install --no-cache-dir \
 RUN pip3 install --no-cache-dir \
     "huggingface_hub" \
     "transformers" \
+    "requests" \
     "sentencepiece" \
     "runpod"
 

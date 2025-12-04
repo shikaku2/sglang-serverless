@@ -1,20 +1,22 @@
 #!/usr/bin/env python
 import os
 import time
+import subprocess
 import traceback
 
 import runpod
 import torch
-from sglang import Runtime, ChatCompletion
+import requests
 
 # ----------------------------
 # Globals
 # ----------------------------
 
-runtime = None          # SGLang runtime (model) – reused across jobs
-GPU_VRAM_GIB = None     # float or None
-AUTO_MAX_TOKENS_CAP = None  # int or None
-MODEL_PATH = None       # the actual HF model we loaded
+GPU_VRAM_GIB = None          # float or None
+AUTO_MAX_TOKENS_CAP = None   # int or None
+MODEL_PATH = None            # HF repo or path
+SGLANG_PORT = int(os.getenv("SGLANG_PORT", "30000"))
+SGLANG_PROC = None           # subprocess.Popen for sglang.launch_server
 
 
 # ----------------------------
@@ -25,8 +27,7 @@ def _init_hardware_info():
     """
     Detect GPU VRAM once and compute an automatic max_tokens cap.
 
-    NOTE: This is deliberately conservative. The VRAM → tokens mapping
-    is a heuristic, not an exact formula.
+    Heuristic, tuned for ~24B quantized model on 48–80GB cards.
     """
     global GPU_VRAM_GIB, AUTO_MAX_TOKENS_CAP
 
@@ -39,17 +40,10 @@ def _init_hardware_info():
             props = torch.cuda.get_device_properties(0)
             vram_gib = props.total_memory / (1024 ** 3)
     except Exception:
-        # If anything goes weird, treat as "no GPU info"
         vram_gib = 0.0
 
     GPU_VRAM_GIB = vram_gib
 
-    # Heuristic caps tuned for a ~24B quantized model:
-    # - <24GB: 1k tokens cap (barely safe)
-    # - 24–40GB: 2k tokens
-    # - 40–60GB (your 48GB case): 4k tokens
-    # - 60–90GB (your 80GB case): 8k tokens
-    # - >90GB: 16k tokens
     if vram_gib <= 0:
         cap = 512
     elif vram_gib < 24:
@@ -57,9 +51,9 @@ def _init_hardware_info():
     elif vram_gib < 40:
         cap = 2048
     elif vram_gib < 60:
-        cap = 4096
+        cap = 4096       # 48 GB case
     elif vram_gib < 90:
-        cap = 8192
+        cap = 8192       # 80 GB case
     else:
         cap = 16384
 
@@ -71,20 +65,16 @@ def _sanitize_sampling_params(event: dict):
     Validate and clamp user sampling params against our auto cap.
 
     Supports both OpenAI-style `max_tokens` and `max_completion_tokens`.
-
-    - If user asks for too many tokens, we clamp to AUTO_MAX_TOKENS_CAP.
-    - If user sends garbage types, we fall back to sane defaults.
     """
     _init_hardware_info()
 
-    # If hardware detection failed for some reason, still have a default cap
     auto_cap = AUTO_MAX_TOKENS_CAP or 2048
 
     # --- max_tokens / max_completion_tokens ---
-    default_max = min(2048, auto_cap)  # default, but never above auto_cap
+    default_max = min(2048, auto_cap)
     raw_requested = event.get(
         "max_tokens",
-        event.get("max_completion_tokens", default_max)
+        event.get("max_completion_tokens", default_max),
     )
 
     try:
@@ -95,7 +85,6 @@ def _sanitize_sampling_params(event: dict):
     if requested <= 0:
         requested = default_max
 
-    # Clamp to [1, auto_cap]
     safe_max = max(1, min(requested, auto_cap))
 
     # --- temperature ---
@@ -104,7 +93,6 @@ def _sanitize_sampling_params(event: dict):
         temperature = float(raw_temp)
     except (TypeError, ValueError):
         temperature = 0.7
-    # clamp to [0, 2]
     if temperature < 0.0:
         temperature = 0.0
     elif temperature > 2.0:
@@ -116,7 +104,6 @@ def _sanitize_sampling_params(event: dict):
         top_p = float(raw_top_p)
     except (TypeError, ValueError):
         top_p = 0.95
-    # clamp to (0, 1]
     if top_p <= 0.0:
         top_p = 0.01
     elif top_p > 1.0:
@@ -135,31 +122,15 @@ def _build_messages(event: dict):
     """
     Build an OpenAI-style `messages` array from the incoming payload.
 
-    Supports two modes:
+    Mode A: full OpenAI body:
+        { "model": "...", "messages": [ {role, content}, ... ], ... }
 
-    1) OpenAI chat-style:
-
-        {
-          "model": "...",          # ignored for now
-          "messages": [
-            {"role": "system", "content": "..."},
-            {"role": "user", "content": "..."},
-            ...
-          ],
-          ...
-        }
-
-    2) Legacy simple payload:
-
-        {
-          "prompt": "...",
-          "system_prompt": "...",   # optional
-          ...
-        }
+    Mode B: legacy:
+        { "prompt": "...", "system_prompt"/"system": "...", ... }
     """
-    # --- Mode 1: OpenAI-style messages ---
+    # --- Mode A: OpenAI-style messages ---
     raw_messages = event.get("messages")
-    if isinstance(raw_messages, list) and len(raw_messages) > 0:
+    if isinstance(raw_messages, list) and raw_messages:
         messages = []
         for m in raw_messages:
             if not isinstance(m, dict):
@@ -169,11 +140,10 @@ def _build_messages(event: dict):
             if not isinstance(role, str) or not isinstance(content, str):
                 continue
             messages.append({"role": role, "content": content})
-
         if messages:
             return messages
 
-    # --- Mode 2: fallback to {system_prompt, prompt} ---
+    # --- Mode B: simple prompt ---
     system_prompt = event.get("system_prompt") or event.get("system")
     prompt = (
         event.get("prompt")
@@ -194,39 +164,79 @@ def _build_messages(event: dict):
 
 
 # ----------------------------
-# Model loading
+# SGLang server management
 # ----------------------------
 
-def load_runtime():
+def _ensure_sglang_server():
     """
-    Lazily initialize the SGLang runtime for your HF model.
+    Start `python -m sglang.launch_server` once per container and wait
+    for /v1/chat/completions to be ready.
     """
-    global runtime, MODEL_PATH
-    if runtime is not None:
-        return runtime
+    global SGLANG_PROC, MODEL_PATH
 
-    _init_hardware_info()
+    if MODEL_PATH is None:
+        MODEL_PATH = os.getenv(
+            "MODEL_PATH",
+            "DavidAU/Llama3.2-24B-A3B-II-Dark-Champion-INSTRUCT-Heretic-Abliterated-Uncensored",
+        )
 
-    model_path = os.getenv(
-        "MODEL_PATH",
-        "DavidAU/Llama3.2-24B-A3B-II-Dark-Champion-INSTRUCT-Heretic-Abliterated-Uncensored",
+    # If already running and healthy, just return
+    if SGLANG_PROC is not None and SGLANG_PROC.poll() is None:
+        try:
+            r = requests.get(
+                f"http://127.0.0.1:{SGLANG_PORT}/health",
+                timeout=1.0,
+            )
+            if r.status_code == 200:
+                return
+        except Exception:
+            # fall through and restart
+            pass
+
+    # (Re)start server
+    cmd = [
+        "python3",
+        "-m",
+        "sglang.launch_server",
+        "--model-path",
+        MODEL_PATH,
+        "--host",
+        "0.0.0.0",
+        "--port",
+        str(SGLANG_PORT),
+        # Keep these conservative; tweak if you want
+        "--mem-fraction-static",
+        "0.60",
+        "--disable-cuda-graph",
+    ]
+
+    # In serverless, we *must not* block forever here, but we do need to
+    # load the model once. Cold start will be chunky, then it's warm.
+    SGLANG_PROC = subprocess.Popen(
+        cmd,
+        env=os.environ.copy(),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
     )
-    MODEL_PATH = model_path
 
-    # If the HF repo is gated/private, you'll need HUGGINGFACE_HUB_TOKEN
-    # or HF_TOKEN set in the environment.
+    # Wait for health endpoint
+    deadline = time.time() + 600  # 10 min max for initial model load
+    last_err = None
 
-    runtime = Runtime(
-        model=model_path,
-        mem_fraction_static=0.60,
-        mem_fraction_dynamic=0.30,
-        disable_torch_compile=True,
-        disable_cuda_graph=True,
-        tokenizer_mode="auto",
-        dtype="bfloat16",  # change to "float16" if bf16 is a problem
-    )
+    while time.time() < deadline:
+        try:
+            r = requests.get(
+                f"http://127.0.0.1:{SGLANG_PORT}/health",
+                timeout=2.0,
+            )
+            if r.status_code == 200:
+                return
+            last_err = f"HTTP {r.status_code}"
+        except Exception as e:
+            last_err = repr(e)
+        time.sleep(2)
 
-    return runtime
+    raise RuntimeError(f"SGLang server failed to become healthy: {last_err}")
 
 
 # ----------------------------
@@ -235,14 +245,11 @@ def load_runtime():
 
 def generate_from_event(event: dict) -> dict:
     """
-    Core logic: takes an `event` dict (your input payload)
-    and returns a structured response.
-
-    `event` is treated as:
-      - an OpenAI /v1/chat/completions body (preferred), OR
-      - your legacy {prompt, system_prompt, ...} format.
+    Take `event` (OpenAI-style or legacy) and run it via
+    SGLang's OpenAI-compatible /v1/chat/completions HTTP API.
     """
-    rt = load_runtime()
+    _init_hardware_info()
+    _ensure_sglang_server()
 
     try:
         messages = _build_messages(event)
@@ -251,36 +258,59 @@ def generate_from_event(event: dict) -> dict:
 
     sampling = _sanitize_sampling_params(event)
 
-    out = ChatCompletion.create(
-        runtime=rt,
-        messages=messages,
-        max_tokens=sampling["max_tokens"],
-        temperature=sampling["temperature"],
-        top_p=sampling["top_p"],
-        stream=False,
-    )
-
-    try:
-        # Assume SGLang returns OpenAI-style dict
-        content = out["choices"][0]["message"]["content"]
-    except Exception as exc:
-        # If SGLang ever changes format, still return *something*
-        return {
-            "error": f"Unexpected SGLang output format: {exc}",
-            "raw": str(out),
-        }
-
     requested_model = event.get("model") or MODEL_PATH
 
+    payload = {
+        "model": requested_model,
+        "messages": messages,
+        "max_tokens": sampling["max_tokens"],
+        "temperature": sampling["temperature"],
+        "top_p": sampling["top_p"],
+        "stream": False,
+    }
+
+    url = f"http://127.0.0.1:{SGLANG_PORT}/v1/chat/completions"
+
+    try:
+        resp = requests.post(url, json=payload, timeout=900)
+    except Exception as e:
+        return {
+            "error": f"Error contacting SGLang server: {e}",
+            "endpoint": url,
+        }
+
+    if not resp.ok:
+        # Bubble up SGLang's error body if present
+        try:
+            body = resp.json()
+        except Exception:
+            body = resp.text
+        return {
+            "error": f"SGLang HTTP {resp.status_code}",
+            "body": body,
+        }
+
+    try:
+        out = resp.json()
+    except Exception as e:
+        return {
+            "error": f"Failed to parse SGLang response JSON: {e}",
+            "raw": resp.text,
+        }
+
+    # Standard OpenAI-style ChatCompletion
+    try:
+        content = out["choices"][0]["message"]["content"]
+    except Exception as exc:
+        return {
+            "error": f"Unexpected SGLang output format: {exc}",
+            "raw": out,
+        }
+
     return {
-        # Simple text for quick consumption
         "response": content,
-
-        # Try to surface SGLang's own metadata if present
-        "usage": out.get("usage", None) if isinstance(out, dict) else None,
-        "model": out.get("model", requested_model) if isinstance(out, dict) else requested_model,
-
-        # Our own metadata and safety clamps
+        "usage": out.get("usage", None),
+        "model": out.get("model", requested_model),
         "sampling": {
             "max_tokens_used": sampling["max_tokens"],
             "max_tokens_requested": sampling["max_tokens_requested"],
@@ -291,6 +321,7 @@ def generate_from_event(event: dict) -> dict:
         "hardware": {
             "gpu_vram_gib": GPU_VRAM_GIB,
         },
+        "raw": out,
     }
 
 
@@ -302,33 +333,24 @@ def handler(job: dict) -> dict:
     """
     RunPod serverless handler.
 
-    Expects either:
+    Expects job["input"] to be either:
 
-    A) OpenAI-style body (inside job["input"]):
-
+    A) OpenAI-style body:
         {
-          "id": "...",                 # added by RunPod
-          "input": {
-            "model": "any-string",     # optional, just echoed back
-            "messages": [
-              {"role": "system", "content": "..."},
-              {"role": "user",   "content": "..."}
-            ],
-            "max_tokens": 4096,        # optional
-            "temperature": 0.7,        # optional
-            "top_p": 0.95,             # optional
-            "stream": false            # ignored; we always run non-streaming
-          }
+          "model": "whatever",   # optional, defaults to MODEL_PATH
+          "messages": [...],
+          "max_tokens": ...,
+          "temperature": ...,
+          "top_p": ...,
         }
 
-    OR the legacy payload (inside job["input"]):
-
+    OR B) legacy body:
         {
-          "prompt": "....",
-          "system_prompt": "...",      # optional
-          "max_tokens": 4096,          # optional
-          "temperature": 0.7,          # optional
-          "top_p": 0.95                # optional
+          "prompt": "...",
+          "system_prompt": "...",  # optional
+          "max_tokens": ...,
+          "temperature": ...,
+          "top_p": ...
         }
     """
     try:
@@ -346,6 +368,5 @@ def handler(job: dict) -> dict:
 
 
 if __name__ == "__main__":
-    # RunPod's serverless wrapper
     runpod.serverless.start({"handler": handler})
 
