@@ -28,6 +28,8 @@ RUN pip3 install --no-cache-dir \
 
 # 3) Install sglang + flashinfer
 RUN pip3 install --no-cache-dir \
+    --prefer-binary \
+    --no-build-isolation \
     "sglang==0.5.6" \
     "flashinfer-python"
 
