@@ -45,4 +45,4 @@ RUN pip3 install --no-cache-dir \
 COPY handler.py /workspace/handler.py
 
 # Default command for RunPod Serverless
-CMD ["python", "-u", "handler.py"]
+CMD ["python3", "-u", "handler.py"]
