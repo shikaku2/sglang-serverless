@@ -39,7 +39,9 @@ RUN pip3 install --no-cache-dir \
     "transformers" \
     "requests" \
     "sentencepiece" \
-    "runpod"
+    "runpod" \
+    "sgl_kernel"
+
 
 # Copy handler (serverless entrypoint)
 COPY handler.py /workspace/handler.py
