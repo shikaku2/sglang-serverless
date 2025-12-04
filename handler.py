@@ -3,10 +3,23 @@ import os
 import time
 import subprocess
 import traceback
+import logging
+import json
 
 import runpod
 import torch
 import requests
+
+# ----------------------------
+# Logging setup
+# ----------------------------
+
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="[handler] %(asctime)s %(levelname)s: %(message)s",
+)
+log = logging.getLogger("handler")
 
 # ----------------------------
 # Globals
@@ -19,10 +32,6 @@ SGLANG_PORT = int(os.getenv("SGLANG_PORT", "30000"))
 SGLANG_PROC = None           # subprocess.Popen for sglang.launch_server
 
 
-def log(msg: str):
-    print(f"[handler] {msg}", flush=True)
-
-
 # ----------------------------
 # Hardware / scaling helpers
 # ----------------------------
@@ -30,7 +39,6 @@ def log(msg: str):
 def _init_hardware_info():
     """
     Detect GPU VRAM once and compute an automatic max_tokens cap.
-
     Heuristic, tuned for ~24B quantized model on 48–80GB cards.
     """
     global GPU_VRAM_GIB, AUTO_MAX_TOKENS_CAP
@@ -43,8 +51,17 @@ def _init_hardware_info():
         if torch.cuda.is_available():
             props = torch.cuda.get_device_properties(0)
             vram_gib = props.total_memory / (1024 ** 3)
+            log.info(
+                "Detected GPU: %s, CC=%d.%d, VRAM=%.2f GiB",
+                props.name,
+                props.major,
+                props.minor,
+                vram_gib,
+            )
+        else:
+            log.warning("torch.cuda.is_available() is False; assuming no GPU.")
     except Exception as e:
-        log(f"_init_hardware_info: torch.cuda check failed: {e}")
+        log.exception("Failed to query CUDA device properties: %s", e)
         vram_gib = 0.0
 
     GPU_VRAM_GIB = vram_gib
@@ -63,7 +80,7 @@ def _init_hardware_info():
         cap = 16384
 
     AUTO_MAX_TOKENS_CAP = cap
-    log(f"_init_hardware_info: vram_gib={vram_gib:.2f}, auto_cap={AUTO_MAX_TOKENS_CAP}")
+    log.info("Auto max_tokens cap set to %d based on %.2f GiB VRAM", cap, vram_gib)
 
 
 def _sanitize_sampling_params(event: dict):
@@ -115,15 +132,22 @@ def _sanitize_sampling_params(event: dict):
     elif top_p > 1.0:
         top_p = 1.0
 
-    sampling = {
+    log.info(
+        "Sampling params -> requested: %s, using max_tokens=%d (cap=%d), temp=%.3f, top_p=%.3f",
+        raw_requested,
+        safe_max,
+        auto_cap,
+        temperature,
+        top_p,
+    )
+
+    return {
         "max_tokens": safe_max,
         "max_tokens_requested": requested,
         "max_tokens_cap": auto_cap,
         "temperature": temperature,
         "top_p": top_p,
     }
-    log(f"_sanitize_sampling_params: {sampling}")
-    return sampling
 
 
 def _build_messages(event: dict):
@@ -148,9 +172,8 @@ def _build_messages(event: dict):
             if not isinstance(role, str) or not isinstance(content, str):
                 continue
             messages.append({"role": role, "content": content})
-
         if messages:
-            log(f"_build_messages: using OpenAI-style messages, count={len(messages)}")
+            log.info("Using OpenAI-style messages with %d entries", len(messages))
             return messages
 
     # --- Mode B: simple prompt ---
@@ -166,12 +189,13 @@ def _build_messages(event: dict):
             "No valid 'messages' array and no non-empty 'prompt' found in input."
         )
 
+    preview = prompt[:120].replace("\n", " ")
+    log.info("Using legacy prompt mode, prompt preview: %r...", preview)
+
     messages = []
     if isinstance(system_prompt, str) and system_prompt.strip():
         messages.append({"role": "system", "content": system_prompt})
     messages.append({"role": "user", "content": prompt})
-
-    log(f"_build_messages: built legacy messages, count={len(messages)}")
     return messages
 
 
@@ -182,7 +206,7 @@ def _build_messages(event: dict):
 def _ensure_sglang_server():
     """
     Start `python -m sglang.launch_server` once per container and wait
-    for /health to be ready.
+    for /v1/chat/completions to be ready.
     """
     global SGLANG_PROC, MODEL_PATH
 
@@ -191,8 +215,7 @@ def _ensure_sglang_server():
             "MODEL_PATH",
             "DavidAU/Llama3.2-24B-A3B-II-Dark-Champion-INSTRUCT-Heretic-Abliterated-Uncensored",
         )
-
-    log(f"_ensure_sglang_server: MODEL_PATH={MODEL_PATH}, PORT={SGLANG_PORT}")
+    log.info("Using MODEL_PATH=%s", MODEL_PATH)
 
     # If already running and healthy, just return
     if SGLANG_PROC is not None and SGLANG_PROC.poll() is None:
@@ -202,16 +225,15 @@ def _ensure_sglang_server():
                 timeout=1.0,
             )
             if r.status_code == 200:
-                log("_ensure_sglang_server: existing SGLang healthy, reusing.")
                 return
             else:
-                log(f"_ensure_sglang_server: existing /health={r.status_code}, restarting.")
+                log.warning("Existing SGLang server unhealthy, status=%s", r.status_code)
         except Exception as e:
-            log(f"_ensure_sglang_server: existing SGLang health check failed: {e}, restarting.")
+            log.warning("Existing SGLang server health check failed: %s", e)
 
+    # (Re)start server
     cmd = [
         "python3",
-        "-u",
         "-m",
         "sglang.launch_server",
         "--model-path",
@@ -223,87 +245,54 @@ def _ensure_sglang_server():
         "--mem-fraction-static",
         "0.60",
         "--disable-cuda-graph",
-        "--trust-remote-code",
     ]
 
-    log(f"_ensure_sglang_server: launching: {' '.join(cmd)}")
+    log.info("Starting SGLang server: %s", " ".join(cmd))
 
+    # In serverless, we must not block forever here, but we do need to
+    # load the model once. Cold start will be chunky, then it's warm.
     SGLANG_PROC = subprocess.Popen(
         cmd,
         env=os.environ.copy(),
+        # inherit stdout/stderr so we see SGLang logs in RunPod output
     )
 
-    log("_ensure_sglang_server: waiting for /health ...")
+    log.info("SGLang server launched with PID %s", SGLANG_PROC.pid)
 
-    wait_timeout = int(os.getenv("SGLANG_WAIT_TIMEOUT", "1800"))
-    deadline = time.time() + wait_timeout
+    # Quick check if it died immediately
+    time.sleep(3)
+    if SGLANG_PROC.poll() is not None:
+        code = SGLANG_PROC.returncode
+        log.error("SGLang server exited immediately with code %s", code)
+        raise RuntimeError(f"SGLang server exited early with code {code}. Check logs above.")
+
+    # Wait for health endpoint
+    deadline = time.time() + 600  # 10 min max for initial model load
     last_err = None
+    attempt = 0
 
     while time.time() < deadline:
-        ret = SGLANG_PROC.poll()
-        if ret is not None:
-            raise RuntimeError(f"SGLang server exited early with code {ret}. Check logs above.")
-
+        attempt += 1
         try:
             r = requests.get(
                 f"http://127.0.0.1:{SGLANG_PORT}/health",
-                timeout=5.0,
+                timeout=2.0,
             )
-            log(f"_ensure_sglang_server: /health status={r.status_code}")
             if r.status_code == 200:
-                log("_ensure_sglang_server: SGLang server is healthy.")
+                log.info("SGLang server is healthy on attempt %d", attempt)
                 return
             last_err = f"HTTP {r.status_code}"
+            if attempt % 10 == 0:
+                log.warning("Health check attempt %d: %s", attempt, last_err)
         except Exception as e:
             last_err = repr(e)
-            log(f"_ensure_sglang_server: waiting for server... {last_err}")
+            if attempt in (1, 5, 10, 20, 30):
+                log.warning("Health check attempt %d failed: %s", attempt, last_err)
+        time.sleep(2)
 
-        time.sleep(5)
-
-    raise RuntimeError(f"SGLang server failed to become healthy within {wait_timeout}s: {last_err}")
-
-
-# ----------------------------
-# Debug handler (no model load)
-# ----------------------------
-
-def handle_debug(event: dict) -> dict:
-    """
-    Lightweight debug path. Does NOT start SGLang.
-    Use this to verify env, GPU, and cache wiring.
-    """
-    log("handle_debug: debug flag detected, returning diagnostics.")
-    _init_hardware_info()
-
-    cache_root = os.getenv("HF_HOME", "/runpod-volume/huggingface-cache")
-    cache_exists = os.path.exists(cache_root)
-    cache_sample = []
-    if cache_exists:
-        try:
-            cache_sample = sorted(os.listdir(cache_root))[:5]
-        except Exception as e:
-            cache_sample = [f"<error listing cache dir: {e}>"]
-
-    return {
-        "debug": True,
-        "env": {
-            "MODEL_PATH": os.getenv("MODEL_PATH", MODEL_PATH),
-            "HF_HOME": os.getenv("HF_HOME"),
-            "TRANSFORMERS_CACHE": os.getenv("TRANSFORMERS_CACHE"),
-            "HUGGINGFACE_HUB_CACHE": os.getenv("HUGGINGFACE_HUB_CACHE"),
-            "SGLANG_PORT": SGLANG_PORT,
-        },
-        "hardware": {
-            "gpu_vram_gib": GPU_VRAM_GIB,
-            "auto_max_tokens_cap": AUTO_MAX_TOKENS_CAP,
-        },
-        "cache": {
-            "root": cache_root,
-            "exists": cache_exists,
-            "sample_entries": cache_sample,
-        },
-        "echo_input_keys": sorted(event.keys()),
-    }
+    # If we get here, it never became healthy
+    log.error("SGLang server failed to become healthy: %s", last_err)
+    raise RuntimeError(f"SGLang server failed to become healthy: {last_err}")
 
 
 # ----------------------------
@@ -315,17 +304,17 @@ def generate_from_event(event: dict) -> dict:
     Take `event` (OpenAI-style or legacy) and run it via
     SGLang's OpenAI-compatible /v1/chat/completions HTTP API.
     """
-    log(f"generate_from_event: start, keys={list(event.keys())}")
     _init_hardware_info()
     _ensure_sglang_server()
 
     try:
         messages = _build_messages(event)
     except ValueError as ve:
-        log(f"generate_from_event: message build error: {ve}")
+        log.warning("Bad input event: %s", ve)
         return {"error": str(ve)}
 
     sampling = _sanitize_sampling_params(event)
+
     requested_model = event.get("model") or MODEL_PATH
 
     payload = {
@@ -338,12 +327,17 @@ def generate_from_event(event: dict) -> dict:
     }
 
     url = f"http://127.0.0.1:{SGLANG_PORT}/v1/chat/completions"
-    log(f"generate_from_event: POST {url} with max_tokens={sampling['max_tokens']}")
+    log.info(
+        "Calling SGLang /v1/chat/completions on %s with model=%s, n_messages=%d",
+        url,
+        requested_model,
+        len(messages),
+    )
 
     try:
         resp = requests.post(url, json=payload, timeout=900)
     except Exception as e:
-        log(f"generate_from_event: HTTP error contacting SGLang: {e}")
+        log.exception("Error contacting SGLang server: %s", e)
         return {
             "error": f"Error contacting SGLang server: {e}",
             "endpoint": url,
@@ -354,7 +348,7 @@ def generate_from_event(event: dict) -> dict:
             body = resp.json()
         except Exception:
             body = resp.text
-        log(f"generate_from_event: SGLang HTTP {resp.status_code}, body={body}")
+        log.error("SGLang HTTP %s error: %s", resp.status_code, body)
         return {
             "error": f"SGLang HTTP {resp.status_code}",
             "body": body,
@@ -363,7 +357,7 @@ def generate_from_event(event: dict) -> dict:
     try:
         out = resp.json()
     except Exception as e:
-        log(f"generate_from_event: failed to parse JSON: {e}")
+        log.exception("Failed to parse SGLang response JSON: %s", e)
         return {
             "error": f"Failed to parse SGLang response JSON: {e}",
             "raw": resp.text,
@@ -372,13 +366,14 @@ def generate_from_event(event: dict) -> dict:
     try:
         content = out["choices"][0]["message"]["content"]
     except Exception as exc:
-        log(f"generate_from_event: unexpected SGLang format: {exc}")
+        log.error("Unexpected SGLang output format: %s; raw=%r", exc, out)
         return {
             "error": f"Unexpected SGLang output format: {exc}",
             "raw": out,
         }
 
-    log("generate_from_event: success, returning response.")
+    log.info("Generation succeeded, returning response of length %d", len(content))
+
     return {
         "response": content,
         "usage": out.get("usage", None),
@@ -424,28 +419,28 @@ def handler(job: dict) -> dict:
           "temperature": ...,
           "top_p": ...
         }
-
-    OR C) debug:
-        {
-          "debug": true
-        }
     """
+    job_id = job.get("id") or job.get("requestId")
+    log.info("Received job id=%s keys=%s", job_id, list(job.keys()))
+
     try:
-        log(f"handler: received job keys={list(job.keys())}")
         event = job.get("input", {}) or {}
         if not isinstance(event, dict):
-            log("handler: job['input'] is not a dict.")
+            log.error("job['input'] is not a dict: %r", type(event))
             return {"error": "job['input'] must be a JSON object/dict."}
 
-        log(f"handler: input keys={list(event.keys())}")
-
-        if event.get("debug") or event.get("action") == "debug":
-            return handle_debug(event)
+        # Log a small debug summary
+        debug_summary = {
+            k: event.get(k)
+            for k in ("model", "max_tokens", "max_completion_tokens", "temperature", "top_p")
+            if k in event
+        }
+        log.info("Event summary: %s", json.dumps(debug_summary))
 
         return generate_from_event(event)
 
     except Exception as e:
-        log(f"handler: exception: {e}")
+        log.exception("Unhandled exception in handler: %s", e)
         return {
             "error": str(e),
             "traceback": traceback.format_exc(),
@@ -453,5 +448,6 @@ def handler(job: dict) -> dict:
 
 
 if __name__ == "__main__":
-    log("__main__: starting RunPod serverless worker.")
+    log.info("Starting RunPod serverless worker main loop.")
     runpod.serverless.start({"handler": handler})
+
