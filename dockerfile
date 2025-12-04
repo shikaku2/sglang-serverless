@@ -9,9 +9,9 @@ RUN apt-get update && apt-get install -y \
 RUN update-alternatives --install /usr/bin/python python /usr/bin/python3 1
 
 ENV PYTHONUNBUFFERED=1 \
-    HF_HOME=/workspace/.cache/huggingface \
-    TRANSFORMERS_CACHE=/workspace/.cache/huggingface \
-    HUGGINGFACE_HUB_CACHE=/workspace/.cache/huggingface
+    HF_HOME=/runpod-volume/huggingface-cache \
+    TRANSFORMERS_CACHE=/runpod-volume/huggingface-cache \
+    HUGGINGFACE_HUB_CACHE=/runpod-volume/huggingface-cache
 
 WORKDIR /workspace
 
