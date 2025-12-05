@@ -20,7 +20,7 @@ jobs:
       # Free as much disk as possible (up to ~30GB extra)
       # https://github.com/jlumbroso/free-disk-space
       - name: Free up disk space
-        uses: jlumbroso/free-disk-space
+        uses: jlumbroso/free-disk-space@main
         with:
           tool-cache: true
           android: true
